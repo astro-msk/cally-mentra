@@ -20,7 +20,8 @@ async function loadDigest(digestPath) {
     }
 }
 const FALLBACK_PERSONA = "You are Cally, a warm, concise voice assistant speaking through smart glasses.";
-const VOICE_RULES = "Answer in one or two short spoken sentences. Lead with the answer. No markdown, no lists, no preamble.";
+const VOICE_RULES = "Answer in AT MOST two short spoken sentences (~40 words total). Lead with the answer. "
+    + "No markdown, no lists, no preamble. If you need info you lack, ask one brief question.";
 async function callOpenAi(cfg, input) {
     const digest = await loadDigest(cfg.digestPath);
     const system = `${digest || FALLBACK_PERSONA}\n\n${VOICE_RULES}`;
