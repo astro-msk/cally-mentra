@@ -73,6 +73,7 @@ const CALLY_ACK_SOUND = (process.env.CALLY_ACK_SOUND || "true").toLowerCase() !=
 // this app serves at /assets/cally-ack.mp3.
 const CALLY_ACK_SOUND_URL = process.env.CALLY_ACK_SOUND_URL
   || (CALLY_PUBLIC_URL ? `${CALLY_PUBLIC_URL}/assets/cally-ack.mp3` : "");
+const CALLY_ACK_VOLUME = clampEnvNumber("CALLY_ACK_VOLUME", 0.28, 0, 1);
 // Speech-to-text language. Indian English ("en-IN") recognises the wake word and
 // accented speech far better than the default US English for that accent.
 const CALLY_TRANSCRIBE_LANGUAGE = process.env.CALLY_TRANSCRIBE_LANGUAGE || "en-US";
@@ -917,7 +918,7 @@ class CallyMentraApp extends AppServer {
       // since no other audio is playing the moment the wake word lands.
       await record.session.audio.playAudio({
         audioUrl: CALLY_ACK_SOUND_URL,
-        volume: 1,
+        volume: CALLY_ACK_VOLUME,
       });
     } catch (error) {
       record.session.logger.warn({ error: this.shortError(error) }, "Wake-word chime failed");
