@@ -15,6 +15,7 @@ import {
 import type { Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import * as fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import {
   LoseFitStore,
@@ -24,7 +25,10 @@ import {
   isLoseFitSummaryCommand,
 } from "./losefit";
 import { callAgentCli } from "./agent-cli";
+import { callOpenAi, type OpenAiBridgeConfig } from "./openai-bridge";
 import { ackChimeWav } from "./sound";
+import { extractWakeCommand as matchWakeCommand, parseExtraVariants, type WakeOptions } from "./wake";
+import * as os from "node:os";
 
 const PORT = parseInt(process.env.PORT || "3017", 10);
 const PACKAGE_NAME = process.env.PACKAGE_NAME || "com.mukil.cally";
@@ -34,6 +38,19 @@ const CALLY_AGENT_WEBHOOK_URL = process.env.CALLY_AGENT_WEBHOOK_URL || "";
 const CALLY_AGENT_BEARER_TOKEN = process.env.CALLY_AGENT_BEARER_TOKEN || "";
 // Local OpenClaw CLI bridge: used when no webhook URL is configured so the
 // local setup still gets full Cally reasoning without standing up an HTTP gateway.
+// Direct OpenAI bridge — the low-latency primary path for the glasses. Calls the
+// Chat Completions API straight from this warm process with a compressed digest
+// of Cally's brain as the system prompt, bypassing the slow full-agent turn.
+const CALLY_OPENAI_API_KEY = process.env.CALLY_OPENAI_API_KEY || "";
+const CALLY_OPENAI_ENABLED = (process.env.CALLY_OPENAI_ENABLED || "true").toLowerCase() !== "false"
+  && Boolean(CALLY_OPENAI_API_KEY);
+const CALLY_OPENAI_MODEL = process.env.CALLY_OPENAI_MODEL || "gpt-5.4-mini";
+const CALLY_OPENAI_BASE_URL = (process.env.CALLY_OPENAI_BASE_URL || "https://api.openai.com").replace(/\/+$/, "");
+const CALLY_OPENAI_MAX_TOKENS = Math.max(64, parseInt(process.env.CALLY_OPENAI_MAX_TOKENS || "400", 10) || 400);
+const CALLY_OPENAI_TIMEOUT_MS = Math.max(2000, parseInt(process.env.CALLY_OPENAI_TIMEOUT_MS || "12000", 10) || 12000);
+const CALLY_OPENAI_DIGEST_PATH = process.env.CALLY_OPENAI_DIGEST_PATH
+  || path.join(os.homedir(), ".openclaw", "workspace-glasses", "AGENTS.md");
+
 const CALLY_AGENT_CLI_ENABLED = (process.env.CALLY_AGENT_CLI_ENABLED || "true").toLowerCase() !== "false";
 const CALLY_AGENT_CLI_PATH = process.env.CALLY_AGENT_CLI_PATH || "openclaw";
 const CALLY_AGENT_CLI_TIMEOUT_SECONDS = Math.max(
@@ -52,9 +69,16 @@ const CAPTURE_DIR = process.env.CALLY_MENTRA_CAPTURE_DIR
 // fetch the wake-word acknowledgement chime. Without it, the chime is skipped.
 const CALLY_PUBLIC_URL = (process.env.CALLY_PUBLIC_URL || "").replace(/\/+$/, "");
 const CALLY_ACK_SOUND = (process.env.CALLY_ACK_SOUND || "true").toLowerCase() !== "false";
-// Debounce so a single spoken request (which streams many interim transcripts)
-// only chirps once.
-const ACK_DEBOUNCE_MS = 3500;
+// Override the chime with any glasses-reachable audio URL; defaults to the MP3
+// this app serves at /assets/cally-ack.mp3.
+const CALLY_ACK_SOUND_URL = process.env.CALLY_ACK_SOUND_URL
+  || (CALLY_PUBLIC_URL ? `${CALLY_PUBLIC_URL}/assets/cally-ack.mp3` : "");
+// Speech-to-text language. Indian English ("en-IN") recognises the wake word and
+// accented speech far better than the default US English for that accent.
+const CALLY_TRANSCRIBE_LANGUAGE = process.env.CALLY_TRANSCRIBE_LANGUAGE || "en-US";
+// Wake-word tuning: extra accepted spellings + fuzzy phonetic matching.
+const CALLY_WAKE_WORDS = process.env.CALLY_WAKE_WORDS || "";
+const CALLY_WAKE_FUZZY = (process.env.CALLY_WAKE_FUZZY || "true").toLowerCase() !== "false";
 const SPEAK_REPLIES = (process.env.CALLY_SPEAK_REPLIES || "true").toLowerCase() !== "false";
 const SPEAK_ON_STARTUP = (process.env.CALLY_MENTRA_SPEAK_ON_STARTUP || "false").toLowerCase() === "true";
 const LED_FEEDBACK = (process.env.CALLY_MENTRA_LED_FEEDBACK || "false").toLowerCase() === "true";
@@ -132,7 +156,6 @@ type SessionRecord = {
   lastTranscript?: string;
   lastReply?: string;
   lastEvent?: string;
-  lastAckAt?: number;
   transcriptHistory: string[];
   notes: string[];
   device: DeviceSnapshot;
@@ -180,6 +203,26 @@ class SessionNotFoundError extends Error {
     super(`No active session: ${sessionId}`);
     this.name = "SessionNotFoundError";
   }
+}
+
+let ackMp3Cache: Buffer | null | undefined;
+/** Loads the bundled MP3 chime once. Returns null if the asset is missing. */
+function ackChimeMp3(): Buffer | null {
+  if (ackMp3Cache !== undefined) return ackMp3Cache;
+  const candidates = [
+    path.resolve(process.cwd(), "assets/cally-ack.mp3"),
+    path.resolve(__dirname, "../assets/cally-ack.mp3"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      ackMp3Cache = readFileSync(candidate);
+      return ackMp3Cache;
+    } catch {
+      // try next candidate
+    }
+  }
+  ackMp3Cache = null;
+  return ackMp3Cache;
 }
 
 function renderWebviewHtml(): string {
@@ -432,9 +475,7 @@ class CallyMentraApp extends AppServer {
     await this.loadNotes(record);
     this.wireSessionEvents(record);
 
-    session.events.onTranscription((data: TranscriptionData) => {
-      void this.handleTranscription(sessionId, data);
-    });
+    this.subscribeTranscription(record, sessionId);
 
     session.events.onDisconnected(() => {
       this.cleanupSession(sessionId);
@@ -470,6 +511,18 @@ class CallyMentraApp extends AppServer {
         .setHeader("content-security-policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors *")
         .type("html")
         .send(renderWebviewHtml());
+    });
+
+    app.get("/assets/cally-ack.mp3", (_req: Request, res: Response) => {
+      const mp3 = ackChimeMp3();
+      if (!mp3) {
+        res.status(404).json({ error: "chime_unavailable" });
+        return;
+      }
+      res
+        .setHeader("cache-control", "public, max-age=86400")
+        .type("audio/mpeg")
+        .send(mp3);
     });
 
     app.get("/assets/cally-ack.wav", (_req: Request, res: Response) => {
@@ -616,21 +669,32 @@ class CallyMentraApp extends AppServer {
     if (SPEAK_ON_STARTUP) void this.safeSpeak(record, "Cally is ready.");
   }
 
+  private subscribeTranscription(record: SessionRecord, sessionId: string): void {
+    const handler = (data: TranscriptionData) => {
+      void this.handleTranscription(sessionId, data);
+    };
+    const lang = CALLY_TRANSCRIBE_LANGUAGE;
+    try {
+      if (lang && lang !== "en-US") {
+        // disableLanguageIdentification=true pins STT to the chosen accent model.
+        record.cleanup.push(record.session.events.onTranscriptionForLanguage(lang, handler, true));
+        record.session.logger.info({ lang }, "Transcription subscribed for language");
+        return;
+      }
+    } catch (error) {
+      record.session.logger.warn({ error: this.shortError(error), lang }, "Language transcription unavailable; using en-US");
+    }
+    record.cleanup.push(record.session.events.onTranscription(handler));
+  }
+
   private async handleTranscription(sessionId: string, data: TranscriptionData): Promise<void> {
+    if (!data.isFinal) return;
+
     const record = this.sessions.get(sessionId);
     if (!record) return;
 
     const text = data.text.trim();
     if (!text) return;
-
-    // Acknowledge the wake word the instant it appears — even in an interim
-    // (non-final) transcript — so the wearer gets an immediate chirp instead of
-    // waiting out the full final transcript plus the agent turn.
-    if (this.extractWakeCommand(text)) {
-      this.acknowledgeWake(record);
-    }
-
-    if (!data.isFinal) return;
 
     record.lastTranscript = text;
     this.pushLimited(record.transcriptHistory, text, 30);
@@ -643,39 +707,43 @@ class CallyMentraApp extends AppServer {
       return;
     }
 
-    this.showText(record, "Thinking...", 3000);
+    // Wake word confirmed and the speaker has finished — chirp + show that we
+    // heard them, then run the (slower) agent turn. Playing now, rather than on
+    // an interim transcript, means the cue isn't masked by the user's own voice.
+    this.acknowledgeWake(record);
+    this.showText(record, "Thinking…", 3000);
     await this.handleCommand(record, command, "voice");
   }
 
-  /** Immediate feedback that the wake word was heard, before the reply is ready. */
+  /** Audible/visible confirmation that the wake word was heard. */
   private acknowledgeWake(record: SessionRecord): void {
-    const now = Date.now();
-    if (record.lastAckAt && now - record.lastAckAt < ACK_DEBOUNCE_MS) return;
-    record.lastAckAt = now;
     this.showText(record, "Cally listening…", 2500);
     if (CALLY_ACK_SOUND) void this.playAckChime(record);
   }
 
   private async playAckChime(record: SessionRecord): Promise<void> {
-    if (!CALLY_PUBLIC_URL) return;
+    if (!CALLY_ACK_SOUND_URL) return;
     try {
       if (record.session.capabilities && record.session.capabilities.hasSpeaker === false) return;
-      // Non-blocking (stopOtherAudio:false) so the chime never delays the turn
-      // and never cuts off the spoken reply, which plays on a different track.
+      // Same path/params as the (working) TTS reply so the device actually plays
+      // it: MP3 over the public URL, default track, stops nothing else of note
+      // since no other audio is playing the moment the wake word lands.
       await record.session.audio.playAudio({
-        audioUrl: `${CALLY_PUBLIC_URL}/assets/cally-ack.wav`,
-        volume: 0.6,
-        stopOtherAudio: false,
+        audioUrl: CALLY_ACK_SOUND_URL,
+        volume: 1,
       });
     } catch (error) {
       record.session.logger.warn({ error: this.shortError(error) }, "Wake-word chime failed");
     }
   }
 
+  private wakeOptions: WakeOptions = {
+    extraVariants: parseExtraVariants(CALLY_WAKE_WORDS),
+    fuzzy: CALLY_WAKE_FUZZY,
+  };
+
   private extractWakeCommand(text: string): string | null {
-    const match = text.match(/\b(cally|kali|callie|hey cally|hey kali)\b[:,]?\s*(.*)$/i);
-    if (!match) return null;
-    return (match[2] || "help").trim();
+    return matchWakeCommand(text, this.wakeOptions);
   }
 
   private async handleCommand(record: SessionRecord, rawCommand: string, origin: "voice" | "control" | "tool"): Promise<string> {
@@ -691,6 +759,14 @@ class CallyMentraApp extends AppServer {
     if (/^(status|battery|wifi|connection|diagnostics)$/i.test(command)) {
       const reply = this.formatStatus(record);
       await this.respond(record, reply, "Status");
+      return reply;
+    }
+
+    // Real-time facts answered locally with the device clock — the LLM has no
+    // live clock, so this is both faster (no network) and actually correct.
+    if (/\b(?:what'?s?|what\s+is|current|today'?s?)\s+(?:the\s+)?(?:time|date|day)\b|\bwhat\s+day\s+is\s+it\b/i.test(command)) {
+      const reply = this.formatDateTime();
+      await this.respond(record, reply, "Clock");
       return reply;
     }
 
@@ -902,11 +978,42 @@ class CallyMentraApp extends AppServer {
       }
     }
 
+    // Primary low-latency path: direct OpenAI with the compressed brain digest.
+    if (CALLY_OPENAI_ENABLED && input.kind !== "photo") {
+      const fast = await this.askViaOpenAi(record, input);
+      if (fast) return fast;
+    }
+
     if (CALLY_AGENT_CLI_ENABLED) {
       return this.askViaCli(record, input);
     }
 
     return this.localReply(record, input);
+  }
+
+  private openAiConfig: OpenAiBridgeConfig = {
+    apiKey: CALLY_OPENAI_API_KEY,
+    model: CALLY_OPENAI_MODEL,
+    digestPath: CALLY_OPENAI_DIGEST_PATH,
+    maxTokens: CALLY_OPENAI_MAX_TOKENS,
+    timeoutMs: CALLY_OPENAI_TIMEOUT_MS,
+    baseUrl: CALLY_OPENAI_BASE_URL,
+  };
+
+  private async askViaOpenAi(
+    record: SessionRecord,
+    input: { kind: "voice" | "photo" | "control"; text: string },
+  ): Promise<string | null> {
+    const result = await callOpenAi(this.openAiConfig, {
+      text: input.text,
+      recentTranscripts: record.transcriptHistory.slice(-10),
+      notes: record.notes.slice(-10),
+    });
+    if (!result.ok) {
+      record.session.logger.warn({ error: result.error, kind: input.kind }, "OpenAI fast path failed; falling back");
+      return null; // fall through to the full agent / local reply
+    }
+    return this.cleanReply(result.text);
   }
 
   private async askViaWebhook(
@@ -1105,6 +1212,17 @@ class CallyMentraApp extends AppServer {
     const wifi = device.wifiConnected ? `WiFi ${device.wifiSsid || "connected"}` : "WiFi unknown/off";
     const bridge = CALLY_AGENT_WEBHOOK_URL ? "agent bridge on" : "agent bridge off";
     return `${battery}. ${phone}. ${wifi}. Mode ${record.mode}. ${bridge}.`;
+  }
+
+  private formatDateTime(): string {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: process.env.CALLY_TIMEZONE || "America/Los_Angeles",
+      weekday: "long",
+      hour: "numeric",
+      minute: "2-digit",
+      month: "long",
+      day: "numeric",
+    }).format(new Date());
   }
 
   private snapshotDevice(session: AppSession): DeviceSnapshot {

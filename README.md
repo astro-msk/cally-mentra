@@ -137,6 +137,35 @@ The endpoint should respond with:
 { "reply": "Short answer to display and speak" }
 ```
 
+## Latency Architecture
+
+The glasses path is tiered for speed (measured ~1s vs ~13–20s for a full agent turn):
+
+1. **Local fast-path (instant):** deterministic commands — `status`, time/date, `captions/quiet`,
+   `remember`, `recap`, LoseFit logging — answered in-process with no network and no LLM.
+2. **Direct OpenAI (~1s):** open-ended questions go straight to the Chat Completions API from this
+   always-warm process, using a **compressed digest** of Cally's brain as the system prompt
+   (`CALLY_OPENAI_*`). The raw model answers in ~0.6s; the full OpenClaw agent turn is ~15s because of
+   per-turn machinery (CLI spawn, gateway context assembly) — not the model — so we bypass it here.
+3. **Full OpenClaw agent (fallback):** used only if the fast path fails/disabled (`CALLY_AGENT_CLI_*`).
+   Full tools/memory, but slow.
+
+### The compressed brain digest
+
+`scripts/make-glasses-digest.mjs` distills the ~150k-char OpenClaw workspace context down to ~8k
+(identity, soul, user, memory index, and a trimmed slice of recent daily memory) and writes it to
+`~/.openclaw/workspace-glasses/AGENTS.md`. That file is the `CALLY_OPENAI_DIGEST_PATH` system prompt —
+this is the deliberate **latency ↔ brain** tradeoff. Regenerate when memory changes:
+
+```bash
+node scripts/make-glasses-digest.mjs
+# keep it fresh, e.g. hourly:
+# crontab -e ->  0 * * * * cd /path/to/apps/cally-mentra && node scripts/make-glasses-digest.mjs
+```
+
+> Note on this EC2 host: 2 vCPU / 3.7G RAM with heavy swap. The instance is the real ceiling on the
+> full-agent path; the direct-OpenAI fast path is what keeps replies snappy under that constraint.
+
 ## Operations Notes
 
 - **"Invalid frontend token format" log noise:** the `@mentra/sdk` global auth middleware logs this
