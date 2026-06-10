@@ -91,10 +91,27 @@ const CALLY_TRANSCRIBE_LANGUAGE = process.env.CALLY_TRANSCRIBE_LANGUAGE || "en-U
 const CALLY_WAKE_WORDS = process.env.CALLY_WAKE_WORDS || "";
 const CALLY_WAKE_FUZZY = (process.env.CALLY_WAKE_FUZZY || "true").toLowerCase() !== "false";
 const SPEAK_REPLIES = (process.env.CALLY_SPEAK_REPLIES || "true").toLowerCase() !== "false";
+// MentraOS TTS is ElevenLabs-backed. Use a softer voice/settings profile by
+// default; keep everything env-tunable so we can quickly adjust after Mukil
+// hears it on the actual glasses.
+const CALLY_TTS_VOICE_ID = process.env.CALLY_TTS_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // Sarah: softer/warmer than the platform default.
+const CALLY_TTS_MODEL_ID = process.env.CALLY_TTS_MODEL_ID || "eleven_flash_v2_5";
+const CALLY_TTS_VOLUME = clampEnvNumber("CALLY_TTS_VOLUME", 0.78, 0, 1);
+const CALLY_TTS_STABILITY = clampEnvNumber("CALLY_TTS_STABILITY", 0.72, 0, 1);
+const CALLY_TTS_SIMILARITY = clampEnvNumber("CALLY_TTS_SIMILARITY", 0.82, 0, 1);
+const CALLY_TTS_STYLE = clampEnvNumber("CALLY_TTS_STYLE", 0.18, 0, 1);
+const CALLY_TTS_SPEED = clampEnvNumber("CALLY_TTS_SPEED", 0.94, 0.7, 1.2);
+const CALLY_TTS_SPEAKER_BOOST = (process.env.CALLY_TTS_SPEAKER_BOOST || "false").toLowerCase() === "true";
 const SPEAK_ON_STARTUP = (process.env.CALLY_MENTRA_SPEAK_ON_STARTUP || "false").toLowerCase() === "true";
 const LED_FEEDBACK = (process.env.CALLY_MENTRA_LED_FEEDBACK || "false").toLowerCase() === "true";
 const ADVANCED_STREAMS = (process.env.CALLY_MENTRA_ADVANCED_STREAMS || "false").toLowerCase() === "true";
 const USE_DISPLAY = (process.env.CALLY_MENTRA_USE_DISPLAY || "false").toLowerCase() === "true";
+function clampEnvNumber(name, fallback, min, max) {
+    const value = parseFloat(process.env[name] || "");
+    if (!Number.isFinite(value))
+        return fallback;
+    return Math.min(max, Math.max(min, value));
+}
 if (!MENTRAOS_API_KEY) {
     console.error("MENTRAOS_API_KEY is required. Copy .env.example to .env and configure it.");
     process.exit(1);
@@ -179,227 +196,397 @@ function ackChimeMp3() {
     return ackMp3Cache;
 }
 function renderWebviewHtml() {
+    const voiceEngine = CALLY_OPENAI_ENABLED
+        ? `${CALLY_OPENAI_MODEL} · fast`
+        : CALLY_AGENT_CLI_ENABLED
+            ? "openclaw agent"
+            : "local";
     return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1c1a17" media="(prefers-color-scheme: dark)" />
     <title>Cally</title>
     <style>
       :root {
         color-scheme: light dark;
-        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #f5f7fa;
-        color: #171a1f;
+        --bg: #f6f3ee;
+        --bg-glow: #efe9e0;
+        --surface: #fffdfa;
+        --surface-soft: #faf7f2;
+        --border: #e9e2d7;
+        --border-strong: #ddd4c6;
+        --text: #211f1b;
+        --muted: #6f675b;
+        --faint: #a59c8e;
+        --accent: #c15f3c;
+        --accent-soft: #f1e3da;
+        --accent-ink: #ffffff;
+        --ok: #5f8c57;
+        --warn: #bf8a3c;
+        --shadow: 0 1px 2px rgba(40, 32, 22, 0.04), 0 8px 24px -12px rgba(40, 32, 22, 0.14);
+        --radius: 16px;
+        --radius-sm: 11px;
+        --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+        --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, ui-serif, serif;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1b1916;
+          --bg-glow: #221f1a;
+          --surface: #252118;
+          --surface-soft: #2b261d;
+          --border: #38322a;
+          --border-strong: #443d33;
+          --text: #f3eee4;
+          --muted: #b4aa99;
+          --faint: #8a8071;
+          --accent: #db8a6a;
+          --accent-soft: #3a2c23;
+          --accent-ink: #1b1410;
+          --ok: #82b277;
+          --warn: #d6a45c;
+          --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px -16px rgba(0, 0, 0, 0.6);
+        }
       }
       * { box-sizing: border-box; }
+      html { -webkit-text-size-adjust: 100%; }
       body {
         margin: 0;
         min-height: 100vh;
-        padding: 20px;
+        padding: clamp(20px, 5vw, 56px) 20px 48px;
+        font-family: var(--sans);
+        color: var(--text);
+        background:
+          radial-gradient(1200px 600px at 50% -10%, var(--bg-glow), transparent 70%),
+          var(--bg);
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
       }
-      main {
-        width: min(100%, 720px);
-        margin: 0 auto;
-      }
-      h1 {
-        margin: 0;
-        font-size: 30px;
-        line-height: 1.1;
-        letter-spacing: 0;
-      }
-      p {
-        margin: 8px 0 0;
-        color: #596171;
-        font-size: 14px;
-        line-height: 1.45;
-      }
-      .grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-        gap: 12px;
-        margin-top: 18px;
-      }
-      .panel {
-        border: 1px solid #dce2eb;
-        border-radius: 8px;
-        background: #ffffff;
-        overflow: hidden;
-      }
-      .panel h2 {
-        margin: 0;
-        padding: 12px 14px;
-        font-size: 13px;
-        letter-spacing: 0;
-        text-transform: uppercase;
-        color: #596171;
-        border-bottom: 1px solid #edf1f5;
-      }
-      .row {
+      .shell { width: min(100%, 640px); margin: 0 auto; }
+
+      .masthead {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 12px;
-        min-height: 42px;
-        padding: 10px 14px;
-        border-top: 1px solid #edf1f5;
-        font-size: 14px;
+        gap: 16px;
+        margin-bottom: 26px;
       }
-      .row:first-of-type { border-top: 0; }
-      .label { color: #596171; }
-      .value {
-        max-width: 62%;
-        overflow-wrap: anywhere;
-        text-align: right;
-        font-weight: 650;
+      .brand { display: flex; align-items: center; gap: 14px; }
+      .mark {
+        width: 44px; height: 44px;
+        border-radius: 13px;
+        display: grid; place-items: center;
+        font-family: var(--serif);
+        font-size: 22px; font-weight: 600;
+        color: var(--accent-ink);
+        background: linear-gradient(150deg, #cf6a45, #b5512f);
+        box-shadow: 0 6px 16px -8px rgba(177, 81, 47, 0.7), inset 0 1px 0 rgba(255,255,255,0.22);
+        letter-spacing: 0.5px;
       }
-      .status {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
+      .brand h1 {
+        margin: 0;
+        font-family: var(--serif);
+        font-size: 27px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        line-height: 1.05;
+      }
+      .tagline { margin: 3px 0 0; color: var(--muted); font-size: 13.5px; }
+
+      .live {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 7px 13px 7px 11px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--surface);
+        font-size: 12.5px; font-weight: 560;
+        color: var(--muted);
+        box-shadow: var(--shadow);
+        white-space: nowrap;
       }
       .dot {
-        width: 9px;
-        height: 9px;
-        border-radius: 999px;
-        background: #aeb7c4;
+        width: 8px; height: 8px; border-radius: 999px;
+        background: var(--faint);
+        box-shadow: 0 0 0 0 transparent;
       }
-      .dot.ok { background: #16a34a; }
-      .dot.warn { background: #eab308; }
-      .actions {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-        gap: 8px;
-        padding: 12px;
+      .dot.ok { background: var(--ok); animation: breathe 2.6s ease-in-out infinite; }
+      .dot.warn { background: var(--warn); }
+      @keyframes breathe {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(95, 140, 87, 0.35); }
+        50% { box-shadow: 0 0 0 5px rgba(95, 140, 87, 0); }
       }
-      button, input, select {
-        width: 100%;
-        min-height: 38px;
-        border: 1px solid #cfd7e3;
-        border-radius: 8px;
-        background: #ffffff;
-        color: inherit;
-        font: inherit;
+      @media (prefers-reduced-motion: reduce) { .dot.ok { animation: none; } }
+
+      .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      @media (max-width: 460px) { .cards { grid-template-columns: 1fr; } }
+
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        padding: 16px 18px;
       }
-      button {
-        cursor: pointer;
-        font-weight: 650;
+      .card + .card-block, .cards + .card-block { margin-top: 14px; }
+      .card h2 {
+        margin: 0 0 6px;
+        font-size: 11.5px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--faint);
       }
-      button.primary {
-        border-color: #0f766e;
-        background: #0f766e;
-        color: #ffffff;
+      .row {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 12px; min-height: 40px;
+        border-top: 1px solid var(--border);
+        font-size: 14.5px;
       }
-      input, select {
-        padding: 0 10px;
+      .row:first-of-type { border-top: 0; }
+      .label { color: var(--muted); }
+      .value {
+        max-width: 62%; text-align: right; font-weight: 580;
+        overflow-wrap: anywhere;
       }
-      .command {
-        display: grid;
-        grid-template-columns: 1fr 110px;
-        gap: 8px;
-        padding: 0 12px 12px;
+      .value.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: var(--muted); }
+
+      .conversation .bubble {
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-radius: 13px;
+        background: var(--surface-soft);
+        border: 1px solid var(--border);
       }
-      @media (prefers-color-scheme: dark) {
-        :root { background: #101318; color: #f4f7fb; }
-        p, .label, .panel h2 { color: #aab3c2; }
-        .panel, button, input, select { border-color: #2a313d; background: #171c24; }
-        .row, .panel h2 { border-color: #252c36; }
-        button.primary { background: #14b8a6; border-color: #14b8a6; color: #06110f; }
+      .conversation .bubble.said {
+        background: var(--accent-soft);
+        border-color: transparent;
       }
+      .bubble-label {
+        display: block;
+        font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+        color: var(--faint); margin-bottom: 4px;
+      }
+      .bubble.said .bubble-label { color: var(--accent); }
+      .bubble p { margin: 0; font-size: 14.5px; color: var(--text); overflow-wrap: anywhere; }
+      .conversation .row.event { margin-top: 12px; padding-top: 12px; }
+
+      .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px; }
+      .chip {
+        appearance: none; cursor: pointer;
+        border: 1px solid var(--border-strong);
+        background: var(--surface);
+        color: var(--text);
+        font: inherit; font-size: 13.5px; font-weight: 540;
+        padding: 8px 14px; border-radius: 999px;
+        transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+      }
+      .chip:hover { background: var(--surface-soft); border-color: var(--faint); }
+      .chip:active { transform: translateY(1px); }
+      .chip.primary {
+        background: var(--accent); border-color: var(--accent); color: var(--accent-ink);
+        box-shadow: 0 6px 16px -10px rgba(177, 81, 47, 0.8);
+      }
+      .chip.primary:hover { background: #b5512f; border-color: #b5512f; }
+
+      .composer { display: flex; gap: 9px; }
+      .composer input {
+        flex: 1; min-width: 0;
+        border: 1px solid var(--border-strong);
+        background: var(--surface-soft);
+        color: var(--text); font: inherit; font-size: 14.5px;
+        padding: 11px 14px; border-radius: var(--radius-sm);
+        transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+      }
+      .composer input::placeholder { color: var(--faint); }
+      .composer input:focus {
+        outline: none; background: var(--surface);
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .send {
+        appearance: none; cursor: pointer;
+        border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
+        font: inherit; font-weight: 600; font-size: 14px;
+        padding: 0 18px; border-radius: var(--radius-sm);
+        transition: background 140ms ease, transform 140ms ease, opacity 140ms ease;
+      }
+      .send:hover { background: #b5512f; border-color: #b5512f; }
+      .send:active { transform: translateY(1px); }
+      .send:disabled, .chip:disabled { opacity: 0.5; cursor: default; transform: none; }
+      .hint { margin: 12px 0 0; font-size: 12.5px; color: var(--faint); min-height: 1px; }
+
+      .foot {
+        margin-top: 22px;
+        display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+        font-size: 12px; color: var(--faint);
+      }
+      .foot .sep { opacity: 0.5; }
     </style>
   </head>
   <body>
-    <main>
-      <h1>Cally</h1>
-      <p>Glasses copilot for voice, vision, status, notes, and quick controls.</p>
-      <section class="grid">
-        <div class="panel">
-          <h2>Status</h2>
-          <div class="row"><span class="label">Server</span><span class="value status"><span id="status-dot" class="dot"></span><span id="status-text">Checking</span></span></div>
-          <div class="row"><span class="label">Sessions</span><span id="sessions" class="value">-</span></div>
-          <div class="row"><span class="label">Package</span><span class="value">${PACKAGE_NAME}</span></div>
+    <main class="shell">
+      <header class="masthead">
+        <div class="brand">
+          <div class="mark" aria-hidden="true">C</div>
+          <div class="brand-text">
+            <h1>Cally</h1>
+            <p class="tagline">Voice copilot for Mentra glasses</p>
+          </div>
         </div>
-        <div class="panel">
-          <h2>Glasses</h2>
-          <div class="row"><span class="label">WiFi</span><span id="wifi" class="value">-</span></div>
-          <div class="row"><span class="label">Battery</span><span id="battery" class="value">-</span></div>
-          <div class="row"><span class="label">Mode</span><span id="mode" class="value">-</span></div>
+        <div class="live" title="Service status">
+          <span id="status-dot" class="dot"></span>
+          <span id="status-text">Checking</span>
         </div>
+      </header>
+
+      <section class="cards">
+        <article class="card">
+          <h2>Overview</h2>
+          <div class="row"><span class="label">Active sessions</span><span id="sessions" class="value">—</span></div>
+          <div class="row"><span class="label">Mode</span><span id="mode" class="value">—</span></div>
+          <div class="row"><span class="label">Connection</span><span id="connection" class="value">—</span></div>
+        </article>
+        <article class="card">
+          <h2>Device</h2>
+          <div class="row"><span class="label">Wi-Fi</span><span id="wifi" class="value">—</span></div>
+          <div class="row"><span class="label">Battery</span><span id="battery" class="value">—</span></div>
+          <div class="row"><span class="label">Package</span><span class="value mono">${PACKAGE_NAME}</span></div>
+        </article>
       </section>
-      <section class="panel" style="margin-top:12px">
-        <h2>Quick Actions</h2>
-        <div class="actions">
-          <button data-command="help">Help</button>
-          <button data-command="status">Status</button>
-          <button data-command="look around" class="primary">Look</button>
-          <button data-command="recap">Recap</button>
-        </div>
-        <div class="command">
-          <input id="command-input" placeholder="Ask Cally..." />
-          <button id="send-command">Send</button>
-        </div>
+
+      <section class="card conversation card-block">
+        <h2>Recent</h2>
+        <div class="bubble heard"><span class="bubble-label">You said</span><p id="last-heard">—</p></div>
+        <div class="bubble said"><span class="bubble-label">Cally said</span><p id="last-reply">—</p></div>
+        <div class="row event"><span class="label">Last event</span><span id="last-event" class="value">—</span></div>
       </section>
+
+      <section class="card console card-block">
+        <h2>Ask Cally</h2>
+        <div class="chips">
+          <button class="chip" data-command="help">Help</button>
+          <button class="chip" data-command="status">Status</button>
+          <button class="chip primary" data-command="look around">Look around</button>
+          <button class="chip" data-command="recap">Recap</button>
+        </div>
+        <div class="composer">
+          <input id="command-input" placeholder="Type a message for Cally…" autocomplete="off" autocapitalize="sentences" />
+          <button id="send-command" class="send">Send</button>
+        </div>
+        <p id="console-hint" class="hint"></p>
+      </section>
+
+      <footer class="foot">
+        <span class="mono" style="font-family:ui-monospace,Menlo,monospace">${PACKAGE_NAME}</span>
+        <span class="sep">·</span>
+        <span>voice engine ${voiceEngine}</span>
+      </footer>
     </main>
     <script>
       const params = new URLSearchParams(location.search);
       const token = params.get("token") || "";
       let sessionId = "";
 
-      async function api(path, options = {}) {
-        const headers = { ...(options.headers || {}) };
+      function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+      }
+
+      async function api(path, options) {
+        options = options || {};
+        const headers = Object.assign({}, options.headers || {});
         const url = new URL(path, location.origin);
         if (token) url.searchParams.set("token", token);
-        return fetch(url.pathname + url.search, { ...options, headers, cache: "no-store" });
+        return fetch(url.pathname + url.search, Object.assign({}, options, { headers: headers, cache: "no-store" }));
+      }
+
+      function setControlsEnabled(enabled) {
+        const send = document.getElementById("send-command");
+        const input = document.getElementById("command-input");
+        if (send) send.disabled = !enabled;
+        if (input) input.disabled = !enabled;
+        document.querySelectorAll("[data-command]").forEach(function (b) { b.disabled = !enabled; });
+      }
+
+      function updateHint() {
+        const hint = document.getElementById("console-hint");
+        if (!hint) return;
+        if (!token) { hint.textContent = "Read-only view. Append ?token=YOUR_TOKEN to send commands."; return; }
+        if (!sessionId) { hint.textContent = "Waiting for an active glasses session…"; return; }
+        hint.textContent = "";
       }
 
       async function refreshStatus() {
         const dot = document.getElementById("status-dot");
-        const status = document.getElementById("status-text");
-        const sessions = document.getElementById("sessions");
         try {
           const response = await fetch("/health", { cache: "no-store" });
           if (!response.ok) throw new Error(String(response.status));
           const data = await response.json();
-          dot.className = "dot ok";
-          status.textContent = "Online";
-          sessions.textContent = String(data.sessions ?? data.activeSessions ?? 0);
-          if (!token) return;
+          if (dot) dot.className = "dot ok";
+          setText("status-text", "Online");
+          const count = data.sessions != null ? data.sessions : (data.activeSessions != null ? data.activeSessions : 0);
+          setText("sessions", String(count));
+
+          if (!token) { setControlsEnabled(false); updateHint(); return; }
           const detailed = await api("/status");
-          if (!detailed.ok) return;
+          if (!detailed.ok) { updateHint(); return; }
           const detail = await detailed.json();
-          const first = detail.sessions?.[0];
-          sessionId = first?.sessionId || "";
-          document.getElementById("mode").textContent = first?.mode || "-";
-          document.getElementById("wifi").textContent = first?.device?.wifiConnected
-            ? (first.device.wifiSsid || "Connected")
-            : "Unknown";
-          document.getElementById("battery").textContent =
-            first?.device?.batteryLevel == null ? "-" : first.device.batteryLevel + "%";
-        } catch {
-          dot.className = "dot warn";
-          status.textContent = "Unavailable";
-          sessions.textContent = "-";
+          const list = detail.sessions || [];
+          const first = list[0];
+          sessionId = (first && first.sessionId) || "";
+          const device = (first && first.device) || {};
+
+          setText("mode", (first && first.mode) || "—");
+          setText("connection", device.glassesConnected ? "Connected" : (first ? "Linked" : "—"));
+          setText("wifi", device.wifiConnected ? (device.wifiSsid || "Connected") : "—");
+          setText("battery", device.batteryLevel == null ? "—" : device.batteryLevel + "%");
+          setText("last-heard", (first && first.lastTranscript) || "—");
+          setText("last-reply", (first && first.lastReply) || "—");
+          setText("last-event", (first && first.lastEvent) || "—");
+
+          setControlsEnabled(Boolean(sessionId));
+          updateHint();
+        } catch (err) {
+          if (dot) dot.className = "dot warn";
+          setText("status-text", "Offline");
+          setText("sessions", "—");
         }
       }
 
       async function sendCommand(text) {
         if (!token || !sessionId || !text) return;
-        await api("/sessions/" + encodeURIComponent(sessionId) + "/command", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ text }),
-        });
-        await refreshStatus();
+        const send = document.getElementById("send-command");
+        if (send) { send.disabled = true; send.textContent = "Sending…"; }
+        try {
+          await api("/sessions/" + encodeURIComponent(sessionId) + "/command", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ text: text }),
+          });
+          await refreshStatus();
+        } finally {
+          if (send) { send.textContent = "Send"; send.disabled = !sessionId; }
+        }
       }
 
-      document.querySelectorAll("[data-command]").forEach((button) => {
-        button.addEventListener("click", () => sendCommand(button.dataset.command));
+      document.querySelectorAll("[data-command]").forEach(function (button) {
+        button.addEventListener("click", function () { sendCommand(button.dataset.command); });
       });
-      document.getElementById("send-command").addEventListener("click", () => {
-        const input = document.getElementById("command-input");
-        sendCommand(input.value.trim());
+      const input = document.getElementById("command-input");
+      function submitInput() {
+        const value = input.value.trim();
+        if (!value) return;
+        sendCommand(value);
         input.value = "";
-      });
+      }
+      document.getElementById("send-command").addEventListener("click", submitInput);
+      input.addEventListener("keydown", function (e) { if (e.key === "Enter") submitInput(); });
+
+      setControlsEnabled(false);
       refreshStatus();
       setInterval(refreshStatus, 10000);
     </script>
@@ -1061,14 +1248,39 @@ class CallyMentraApp extends sdk_1.AppServer {
         }
     }
     async safeSpeak(record, text) {
+        const options = this.softTtsOptions();
         try {
             if (record.session.capabilities && record.session.capabilities.hasSpeaker === false)
                 return;
-            await record.session.audio.speak(text);
+            await record.session.audio.speak(text, options);
         }
         catch (error) {
-            record.session.logger.warn({ error }, "TTS failed");
+            record.session.logger.warn({ error }, "Soft TTS failed; retrying platform default");
+            try {
+                await record.session.audio.speak(text);
+            }
+            catch (retryError) {
+                record.session.logger.warn({ error: retryError }, "TTS failed");
+            }
         }
+    }
+    softTtsOptions() {
+        const options = {
+            voice_settings: {
+                stability: CALLY_TTS_STABILITY,
+                similarity_boost: CALLY_TTS_SIMILARITY,
+                style: CALLY_TTS_STYLE,
+                use_speaker_boost: CALLY_TTS_SPEAKER_BOOST,
+                speed: CALLY_TTS_SPEED,
+            },
+            volume: CALLY_TTS_VOLUME,
+            trackId: 2,
+        };
+        if (CALLY_TTS_VOICE_ID)
+            options.voice_id = CALLY_TTS_VOICE_ID;
+        if (CALLY_TTS_MODEL_ID)
+            options.model_id = CALLY_TTS_MODEL_ID;
+        return options;
     }
     async blink(record, color) {
         if (!LED_FEEDBACK)
