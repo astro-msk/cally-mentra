@@ -15,6 +15,8 @@ Server-side MentraOS app that lets Mukil invoke Cally from Mentra glasses.
 - Logs meals through a local LoseFit bridge so voice commands like `Cally log lunch chicken bowl` become reviewable food logs.
 - Forwards voice/photo/location context to a configurable Cally bridge endpoint.
 - Exposes local control endpoints and a richer `/webview` surface for the OpenClaw `cally-mentra` skill.
+- Accepts an optional direct, authenticated Wi-Fi WebSocket from Mentra Live for low-latency
+  `hello`/heartbeat/`ping`/`pong`/status diagnostics while retaining the Mentra SDK path.
 
 Server-side apps can observe Mentra Live WiFi/device state, but WiFi network joining/configuration still appears to be owned by the MentraOS phone/glasses setup flow rather than a cloud app SDK call.
 
@@ -38,7 +40,10 @@ MentraOS docs say apps are server-side JavaScript/TypeScript services that conne
 
 ## Local Control API
 
-Use `Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN` when configured.
+Protected routes require `Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN`; query-string tokens
+are rejected. The webview can read the token from `#token=...`, which remains in the browser
+fragment and is converted to the same header. In production, use random values of at least 32 bytes
+for both this token and `CALLY_COOKIE_SECRET`.
 
 ```bash
 curl http://localhost:3017/health
@@ -52,6 +57,222 @@ curl -X POST -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" -H 'content-
 curl -X POST -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" -H 'content-type: application/json' \
   -d '{"prompt":"What am I looking at?","size":"medium"}' http://localhost:3017/sessions/<sessionId>/capture
 ```
+
+## Direct Mentra Live Wi-Fi POC
+
+The endpoint has two authentication modes:
+
+- **Production:** Cloudflare Access service credentials on the WebSocket upgrade. Cloudflare admits
+  the request and adds a short-lived signed assertion; Cally verifies that assertion and binds its
+  service-token identity to one configured `deviceId`.
+- **Local development:** a dedicated `CALLY_GLASSES_DEVICE_TOKEN`. This fallback is rejected when
+  `NODE_ENV=production` and must never be exposed on a public origin.
+
+If neither mode is configured, upgrades at the direct path fail closed with `503`; the existing
+`@mentra/sdk` routes and sessions continue normally. The POC accepts JSON text messages only, caps
+each message at `CALLY_GLASSES_MAX_PAYLOAD_BYTES`, requires `hello` before all other messages,
+expires missed heartbeats, and permits one current connection for each `deviceId`. A newer hello for
+the same device replaces the older socket.
+
+### Cloudflare Access production setup
+
+1. Use a dedicated hostname such as `glasses.example.com` and publish Cally through a Cloudflare
+   Tunnel. Keep the origin port private so callers cannot bypass Access.
+2. Create a Cloudflare Access self-hosted application for that hostname. Add a `Service Auth` policy
+   that includes the specific service token for each glasses; do not use a bypass or “any token”
+   rule.
+3. Configure all three origin verifier values together:
+
+   ```text
+   CALLY_CLOUDFLARE_ACCESS_ISSUER=https://<team>.cloudflareaccess.com
+   CALLY_CLOUDFLARE_ACCESS_AUDIENCE=<application-aud-tag>
+   CALLY_CLOUDFLARE_ACCESS_DEVICE_BINDINGS_JSON={"<service-token-client-id>":"mentra-live-001"}
+   ```
+
+4. Provision only the dedicated WSS URL and that device's service-token pair to ASG. ASG presents:
+
+   ```text
+   CF-Access-Client-Id: <per-device-client-id>
+   CF-Access-Client-Secret: <per-device-client-secret>
+   ```
+
+Cally validates the `Cf-Access-Jwt-Assertion` signature using Cloudflare's rotating JWKS, plus exact
+issuer, audience, expiry, and service-token `common_name`. A valid Cloudflare token still cannot
+claim another configured glasses ID. Cally closes the WSS shortly before assertion expiry with code
+`4003`; ASG reconnects with the service headers, and Cloudflare supplies a fresh short-lived
+assertion on the new upgrade.
+
+This connection renewal does not rotate the longer-lived client secret. Cloudflare calls extending
+the token's expiration **refresh**, while generating a replacement secret is a separate **rotate**
+operation. Secret rotation will use current/next credential slots once phone-based provisioning is
+implemented; do not place a Cloudflare management API token on the glasses or in this repository.
+
+Cloudflare references: [service tokens and rotation](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/),
+[Access JWT validation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/),
+and [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/).
+
+#### Automatic service-token expiration renewal
+
+The repository includes a one-shot, scheduler-friendly renewal job. Give this job—not the Cally
+runtime and never ASG—a Cloudflare API token scoped only to `Access: Service Tokens Write` for the
+target account:
+
+```bash
+CLOUDFLARE_API_TOKEN=<server-secret> \
+CLOUDFLARE_ACCOUNT_ID=<32-hex-account-id> \
+CALLY_CLOUDFLARE_SERVICE_TOKEN_IDS=<uuid>[,<uuid>...] \
+npm run auth:refresh-cloudflare
+```
+
+It sequentially calls Cloudflare's official `refresh` endpoint, times out stalled calls, attempts
+every configured token, exits nonzero if any fail, and logs only token ID, safe name, and new expiry.
+Store these three variables in a root-readable scheduler environment file rather than the main app's
+`.env`, then run the command monthly with a systemd timer or equivalent. Also enable Cloudflare's
+service-token expiry alert as a backup.
+
+This job extends expiration without changing the client secret. Scheduled **secret rotation** is a
+later phone-provisioning milestone because an intermittently offline device needs current/next
+credential slots and a grace window before the old secret is revoked.
+
+### Local-development fallback
+
+For the first same-LAN ping, use the ignored `.env` files and a random credential:
+
+```text
+ws://<server-LAN-IP>:3017/v1/glasses/connect
+X-Cally-Device-Token: <CALLY_GLASSES_DEVICE_TOKEN>
+```
+
+Do not put any device credential in a URL, source file, log, or Git commit.
+
+Every message uses this envelope:
+
+```json
+{
+  "type": "hello|heartbeat|ping|pong|status",
+  "requestId": "optional-correlation-id",
+  "timestamp": 0,
+  "payload": {}
+}
+```
+
+The first message must be protocol version 1:
+
+```json
+{
+  "type": "hello",
+  "timestamp": 0,
+  "payload": {
+    "protocolVersion": 1,
+    "deviceId": "mentra-live-001",
+    "processSid": "a1b2c3d4",
+    "deviceModel": "Mentra Live",
+    "androidVersion": "11",
+    "androidSdk": 30,
+    "appVersion": "1.0"
+  }
+}
+```
+
+The server answers a valid first message with an accepted `hello` acknowledgement. The ASG does not
+consider the route ready, send periodic telemetry, or accept `ping` until that acknowledgement
+arrives. This separates a TCP/WebSocket connection from a working application-protocol session.
+
+Heartbeat and status payloads may include `battery`, `charging`, `wifiConnected`, `wifiSsid`,
+`wifiRssi`, and `localIp`. The server echoes a client `ping` as a correlated `pong`; the glasses must
+likewise correlate server `ping`/status requests with the same `requestId`.
+
+Direct-device diagnostics and controls reuse `CALLY_MENTRA_CONTROL_TOKEN` and return `401` when it
+is missing or incorrect:
+
+```bash
+curl -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" \
+  http://localhost:3017/v1/glasses
+curl -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" \
+  http://localhost:3017/v1/glasses/mentra-live-001
+curl -X POST -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" \
+  http://localhost:3017/v1/glasses/mentra-live-001/ping
+curl -X POST -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" \
+  http://localhost:3017/v1/glasses/mentra-live-001/status
+```
+
+This first POC is intentionally diagnostic-only. It does not put camera, microphone, speaker,
+streaming, OTA, reboot, or general commands on the direct route.
+
+### First end-to-end ping walkthrough
+
+This is the smallest useful hardware experiment. It deliberately uses build-time ASG settings; the
+next milestone will provision the endpoint and device credential from the phone and persist them on
+the glasses.
+
+1. For the smallest same-LAN test, give the server two different development credentials in its
+   ignored `.env`:
+
+   ```text
+   CALLY_GLASSES_DEVICE_TOKEN=<random-device-token>
+   CALLY_MENTRA_CONTROL_TOKEN=<different-random-control-token>
+   ```
+
+   The device token authenticates the glasses WebSocket. The control token authenticates your
+   diagnostic `curl` request. Keeping them separate prevents a compromised glasses credential from
+   automatically authorizing server controls.
+
+   For the Cloudflare test instead, leave `CALLY_GLASSES_DEVICE_TOKEN` empty and configure the three
+   `CALLY_CLOUDFLARE_ACCESS_*` values described above. Keep the control token separate in either
+   case.
+
+2. Start Cally with `npm run dev`. The Cloudflare route is
+   `wss://glasses.<domain>/v1/glasses/connect`; a same-LAN debug listener is
+   `ws://<server-LAN-IP>:3017/v1/glasses/connect`.
+
+3. In the ignored `MentraOS/asg_client/.env`, select the corresponding authentication mode:
+
+   ```text
+   CALLY_DIRECT_MODE=enabled
+   CALLY_DIRECT_URL=wss://<reachable-cally-host>/v1/glasses/connect
+   CALLY_DIRECT_CF_ACCESS_CLIENT_ID=<per-device-client-id>
+   CALLY_DIRECT_CF_ACCESS_CLIENT_SECRET=<per-device-client-secret>
+
+   # Or, for the same-LAN development test only:
+   # CALLY_DIRECT_DEVICE_TOKEN=<random-device-token>
+   ```
+
+   A cleartext same-LAN debug build instead needs `CALLY_DIRECT_ALLOW_CLEARTEXT_DEBUG=true`. Never
+   put a credential in the URL or commit either `.env` file. These first-POC values become Android
+   `BuildConfig` fields and can be extracted from the APK; phone provisioning into protected runtime
+   storage is the next credential milestone.
+
+4. Build and install the third-party ASG using the repository's Mentra Live development/recovery
+   workflow, then watch only the new sidecar logs:
+
+   ```bash
+   ./gradlew :app:assembleDebug
+   ./scripts/dev-setup.sh
+   adb logcat -s DirectWebSocket
+   ```
+
+5. Wait for `Direct Cally hello acknowledged`, list connected devices, and copy the returned
+   `deviceId`:
+
+   ```bash
+   curl -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" \
+     http://localhost:3017/v1/glasses
+   ```
+
+6. Send the first real command:
+
+   ```bash
+   curl -X POST -H "Authorization: Bearer $CALLY_MENTRA_CONTROL_TOKEN" \
+     http://localhost:3017/v1/glasses/<deviceId>/ping
+   ```
+
+   Success is an HTTP response whose nested WebSocket response has `type: "pong"` and the same
+   generated `requestId`. That correlation proves the request went server → glasses → server; a
+   plain HTTP health response would not prove the glasses participated.
+
+7. For the Cloudflare path, confirm the device snapshot reports `authKind: "cloudflare_access"`.
+   When the short-lived Access assertion reaches its renewal window, Cally closes with code `4003`;
+   the existing ASG reconnect loop presents the service headers again and receives a fresh assertion.
 
 ## LoseFit Meal Logging
 
@@ -170,9 +391,9 @@ node scripts/make-glasses-digest.mjs
 
 - **"Invalid frontend token format" log noise:** the `@mentra/sdk` global auth middleware logs this
   whenever a webview request carries a frontend token that isn't in its `userId:hash` form. The token
-  is supplied by MentraOS infrastructure and the SDK recovers on its own (it falls back to this app's
-  `CALLY_MENTRA_CONTROL_TOKEN` auth), so it is harmless. The app collapses these into a once-per-minute
-  counter line instead of a per-request stack trace; all other errors pass through untouched.
+  is supplied by MentraOS infrastructure and the SDK catches its own format error. This app's
+  protected routes still independently require `CALLY_MENTRA_CONTROL_TOKEN`. The app collapses those
+  SDK warnings into a once-per-minute counter line; all other errors pass through untouched.
 - **Resilience:** control routes return structured JSON errors (`400` for invalid input, `404` for an
   unknown session, `401` unauthorized, `500` otherwise), and unhandled rejections / uncaught exceptions
   are logged rather than crashing the service.
@@ -187,3 +408,14 @@ npm run build
 sudo systemctl restart cally-mentra.service
 systemctl status cally-mentra.service --no-pager
 ```
+
+## Tests
+
+```bash
+npm test
+npm run typecheck
+```
+
+The direct-glasses suite runs against ephemeral local HTTP/WebSocket servers and covers
+authentication, hello ordering, duplicate replacement, request correlation, payload limits,
+heartbeat expiry, protected HTTP diagnostics, and shutdown cleanup.

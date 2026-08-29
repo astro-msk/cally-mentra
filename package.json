@@ -6,9 +6,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
+    "auth:refresh-cloudflare": "node scripts/refresh-cloudflare-service-tokens.mjs",
     "losefit": "tsx src/losefit-cli.ts",
     "start": "node dist/index.js",
     "smoke:losefit": "tsx src/losefit-cli.ts smoke --path /tmp/cally-losefit-smoke.jsonl",
+    "test": "npm run build && node --test test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [],
@@ -18,11 +20,15 @@
   "dependencies": {
     "@mentra/sdk": "^2.1.29",
     "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "jose": "^6.2.10",
+    "ws": "^8.21.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.1",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3"
   }

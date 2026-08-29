@@ -45,10 +45,14 @@ const openai_bridge_1 = require("./openai-bridge");
 const sound_1 = require("./sound");
 const wake_1 = require("./wake");
 const os = __importStar(require("node:os"));
+const direct_glasses_1 = require("./direct-glasses");
+const cloudflare_access_1 = require("./cloudflare-access");
 const PORT = parseInt(process.env.PORT || "3017", 10);
 const PACKAGE_NAME = process.env.PACKAGE_NAME || "com.mukil.cally";
 const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY;
 const CONTROL_TOKEN = process.env.CALLY_MENTRA_CONTROL_TOKEN || "";
+const CALLY_COOKIE_SECRET = process.env.CALLY_COOKIE_SECRET || "";
+const controlAuthorized = (0, direct_glasses_1.createDirectGlassesBearerAuthorizer)(CONTROL_TOKEN);
 const CALLY_AGENT_WEBHOOK_URL = process.env.CALLY_AGENT_WEBHOOK_URL || "";
 const CALLY_AGENT_BEARER_TOKEN = process.env.CALLY_AGENT_BEARER_TOKEN || "";
 // Local OpenClaw CLI bridge: used when no webhook URL is configured so the
@@ -117,12 +121,22 @@ if (!MENTRAOS_API_KEY) {
     console.error("MENTRAOS_API_KEY is required. Copy .env.example to .env and configure it.");
     process.exit(1);
 }
+if (process.env.NODE_ENV === "production" && Buffer.byteLength(CALLY_COOKIE_SECRET) < 32) {
+    console.error("CALLY_COOKIE_SECRET must contain at least 32 bytes in production.");
+    process.exit(1);
+}
+if (process.env.NODE_ENV === "production"
+    && CONTROL_TOKEN
+    && Buffer.byteLength(CONTROL_TOKEN) < 32) {
+    console.error("CALLY_MENTRA_CONTROL_TOKEN must contain at least 32 bytes in production.");
+    process.exit(1);
+}
 // --- Quiet a known-benign, self-recovered log line from @mentra/sdk ---------
 // The SDK registers a global auth middleware that calls verifyFrontendToken()
 // on every request. When a MentraOS webview request arrives with a frontend
 // token that is not in the SDK's `userId:hash` form, that function throws
 // internally, console.error()s "Frontend token verification failed: ...", and
-// then catches it and falls back to our own CONTROL_TOKEN auth. The token is
+// then catches it; our protected routes still perform strict bearer authentication. The token is
 // supplied by MentraOS infrastructure, so the app cannot change its format and
 // the failure is harmless. Instead of emitting a full stack trace per request,
 // we collapse these into a periodic counter while passing every other error
@@ -488,7 +502,7 @@ function renderWebviewHtml() {
       </footer>
     </main>
     <script>
-      const params = new URLSearchParams(location.search);
+      const params = new URLSearchParams(location.hash.replace(/^#/, ""));
       const token = params.get("token") || "";
       let sessionId = "";
 
@@ -501,7 +515,7 @@ function renderWebviewHtml() {
         options = options || {};
         const headers = Object.assign({}, options.headers || {});
         const url = new URL(path, location.origin);
-        if (token) url.searchParams.set("token", token);
+        if (token) headers.authorization = "Bearer " + token;
         return fetch(url.pathname + url.search, Object.assign({}, options, { headers: headers, cache: "no-store" }));
       }
 
@@ -516,7 +530,7 @@ function renderWebviewHtml() {
       function updateHint() {
         const hint = document.getElementById("console-hint");
         if (!hint) return;
-        if (!token) { hint.textContent = "Read-only view. Append ?token=YOUR_TOKEN to send commands."; return; }
+        if (!token) { hint.textContent = "Read-only view. Append #token=YOUR_TOKEN to send commands."; return; }
         if (!sessionId) { hint.textContent = "Waiting for an active glasses session…"; return; }
         hint.textContent = "";
       }
@@ -632,7 +646,48 @@ class CallyMentraApp extends sdk_1.AppServer {
         const reply = await this.handleCommand(record, text, "tool");
         return reply;
     }
-    wireControlEndpoints() {
+    /**
+     * Preserves AppServer.start() (including SDK startup checks) while capturing
+     * the HTTP server that its private implementation otherwise discards.
+     */
+    startWithDirectGlasses(directGlasses) {
+        const app = this.getExpressApp();
+        const originalListenProperty = app.listen;
+        const originalListen = app.listen.bind(app);
+        let httpServer;
+        app.listen = ((port, callback) => {
+            const startedServer = originalListen(port, callback);
+            try {
+                directGlasses.attach(startedServer);
+            }
+            catch (error) {
+                startedServer.close();
+                throw error;
+            }
+            httpServer = startedServer;
+            this.addCleanupHandler(() => {
+                directGlasses.close();
+                try {
+                    startedServer.close();
+                }
+                catch {
+                    // Cleanup can run after a failed or already-complete close.
+                }
+            });
+            return startedServer;
+        });
+        try {
+            const started = super.start();
+            if (!httpServer) {
+                return Promise.reject(new Error("Mentra AppServer did not create an HTTP listener"));
+            }
+            return started;
+        }
+        finally {
+            app.listen = originalListenProperty;
+        }
+    }
+    wireControlEndpoints(directGlasses) {
         const app = this.getExpressApp();
         app.get("/", (_req, res) => {
             res.redirect(302, "/webview");
@@ -729,6 +784,9 @@ class CallyMentraApp extends sdk_1.AppServer {
                 return { ok: true, reply };
             });
         });
+        // Unlike legacy local controls, the direct-device surface fails closed if
+        // no control token is configured.
+        (0, direct_glasses_1.registerDirectGlassesHttpRoutes)(app, directGlasses, (0, direct_glasses_1.createDirectGlassesBearerAuthorizer)(CONTROL_TOKEN));
         // Registered after all routes: JSON 404 for unknown paths, then a final
         // 4-arg error handler so a synchronous throw anywhere in the control
         // surface returns clean JSON and a logged stack instead of Express's
@@ -1391,11 +1449,7 @@ class CallyMentraApp extends sdk_1.AppServer {
         return record;
     }
     authorized(req) {
-        if (!CONTROL_TOKEN)
-            return true;
-        const header = String(req.headers.authorization || "");
-        const token = header.replace(/^Bearer\s+/i, "") || String(req.query?.token || "");
-        return token === CONTROL_TOKEN;
+        return controlAuthorized(req);
     }
     async routeAsync(res, fn) {
         try {
@@ -1422,15 +1476,35 @@ class CallyMentraApp extends sdk_1.AppServer {
         }
     }
 }
-const server = new CallyMentraApp({
+const appServer = new CallyMentraApp({
     packageName: PACKAGE_NAME,
     apiKey: MENTRAOS_API_KEY,
     port: PORT,
+    ...(CALLY_COOKIE_SECRET ? { cookieSecret: CALLY_COOKIE_SECRET } : {}),
 });
-server.wireControlEndpoints();
-server.start()
+const directGlassesConfig = (0, direct_glasses_1.directGlassesConfigFromEnv)(process.env);
+const cloudflareAccessConfig = (0, cloudflare_access_1.cloudflareAccessConfigFromEnv)(process.env);
+let directGlassesAuthMode = directGlassesConfig.deviceToken
+    ? "development shared token"
+    : "disabled";
+if (cloudflareAccessConfig) {
+    directGlassesConfig.upgradeAuthenticator =
+        (0, cloudflare_access_1.createCloudflareAccessUpgradeAuthenticator)(cloudflareAccessConfig);
+    // An injected authenticator takes precedence already, but removing this value
+    // makes it explicit that production never falls back when Access rejects.
+    delete directGlassesConfig.deviceToken;
+    directGlassesAuthMode = "Cloudflare Access";
+}
+else if (process.env.NODE_ENV === "production" && directGlassesConfig.deviceToken) {
+    console.error("CALLY_GLASSES_DEVICE_TOKEN is development-only; configure Cloudflare Access for production.");
+    process.exit(1);
+}
+const directGlasses = new direct_glasses_1.DirectGlassesGateway(directGlassesConfig, appServer.logger);
+appServer.wireControlEndpoints(directGlasses);
+appServer.startWithDirectGlasses(directGlasses)
     .then(() => {
     console.log(`Cally Mentra app listening on port ${PORT}`);
+    console.log(`Direct glasses WSS: ${directGlasses.enabled ? `enabled (${directGlassesAuthMode})` : "disabled"}`);
     const bridge = CALLY_AGENT_WEBHOOK_URL
         ? "webhook"
         : CALLY_AGENT_CLI_ENABLED
@@ -1439,6 +1513,7 @@ server.start()
     console.log(`Cally agent bridge: ${bridge}`);
 })
     .catch((error) => {
+    directGlasses.close();
     console.error("Cally Mentra app failed to start:", error);
     process.exit(1);
 });
